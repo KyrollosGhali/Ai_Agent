@@ -1,102 +1,99 @@
-# agent.py
-from typing import List, Optional, TypedDict
-from langchain_core.messages import (
-    SystemMessage,
-    ToolMessage,
-    HumanMessage,
-    AnyMessage
-)
-from langgraph.graph import add_messages
-from langchain_google_genai import ChatGoogleGenerativeAI  # Gemini API client
-from langchain_core.tools import Tool
-import base64
-from io import BytesIO
-from PIL import Image
-# -------------------------
-# Conversation / Agent State
-# -------------------------
-class ImageGenState(TypedDict):
-    generation_output: Optional[List[str]]  # base64 strings of images
-    messages: Optional[List[AnyMessage]]
+from langgraph.graph import StateGraph, START, END
+from typing import TypedDict, Annotated, Sequence, Literal
+from langchain_core.messages import SystemMessage, BaseMessage
+from langgraph.prebuilt import ToolNode
+from langgraph.graph.message import add_messages
+import os
+import replicate
+from dotenv import load_dotenv
+from langchain_core.tools import tool
+from langchain_groq.chat_models import ChatGroq
 
-# -------------------------
-# Gemini Image Generator Tool
-# -------------------------
-class GeminiImageGenerator:
-    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-2.0-flash"):
-        self.api_key = api_key
-        self.client = ChatGoogleGenerativeAI(api_key=api_key, model=model)
+# Load environment variables from .env before reading API keys.
+load_dotenv()
 
-    def generate_image(self, prompt: str, width=512, height=512) -> str:
-        """Call Gemini AI to generate an image from prompt."""
-        result = self.client.generate_image(prompt=prompt, width=width, height=height)
-        # Gemini typically returns base64-encoded images
-        img_base64 = result.image_base64
-        return img_base64
-
-# -------------------------
-# Agent Creation
-# -------------------------
-def create_agent(api_key: Optional[str] = None, model: str = "gemini-2.0-flash"):
-    image_generator = GeminiImageGenerator(api_key=api_key, model=model)
-
-    # Wrap as a callable tool for LangGraph
-    def generate_image_tool(prompt: str) -> str:
-        print(f"Generating image for prompt: {prompt}")
-        return image_generator.generate_image(prompt)
-
-    # System prompt instructing LLM to generate story and images
-    system_prompt = """
-    You are a friendly assistant that generates images based on user requests.
-    First, generate a story and extract 3-5 key scenes.
-    Then, for each scene, call the "generate_image_tool".
-    """
-
-    # Gemini LLM
-    llm_agent = ChatGoogleGenerativeAI(
-        api_key=api_key,
-        model=model,
-        temperature=0.0,
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+token = os.getenv("REPLICATE_API_TOKEN")
+if not token:
+    raise RuntimeError(
+        "REPLICATE_API_TOKEN is not set. Add it to your .env file or environment variables."
     )
-    llm_agent = llm_agent.bind_tools([generate_image_tool])
+client = replicate.Client(api_token=token)
+@tool
+def generate_image(prompt : str)-> str :
+    """Generates an image based on the given prompt using the Google Imagen model."""
+    payload = {
+        "prompt": prompt,
+        "aspect_ratio": "16:9",
+        "safety_filter_level": "block_medium_and_above"
+    }
+    raw_output = client.run(
+        "google/imagen-4",
+        input=payload
+    )
+    outputs = raw_output if isinstance(raw_output, list) else [raw_output]
 
-    # -------------------------
-    # Assistant Function
-    # -------------------------
-    def assistant(state: ImageGenState) -> ImageGenState:
-        messages = state.get("messages", [])
-        if not messages or (messages[-1].name != "generate_image_tool" and len(messages) == 1):
-            messages = add_messages(
-                [SystemMessage(content=system_prompt)],
-                [HumanMessage(content=messages[-1].content if messages else "Generate a story")]
-            )
+    first = outputs[0]
+    if isinstance(first, dict):
+        return first.get("url", "")
+    if isinstance(first, str):
+        return first
 
-        response = llm_agent.invoke(messages)
-        response.pretty_print()
+    # Replicate may return FileOutput objects with a `.url` attribute.
+    file_url = getattr(first, "url", None)
+    if isinstance(file_url, str) and file_url:
+        return file_url
 
-        state["messages"] = add_messages(messages, [response])
-        return state
+    # Fallback for FileOutput-like objects: stringify the output.
+    value = str(first).strip()
+    if value:
+        return value
 
-    def extract_images(state: ImageGenState) -> ImageGenState:
-        generation_output = state.get("generation_output", [])
-        if generation_output is None:
-            generation_output = []
+    raise RuntimeError("Image generation returned an unsupported output format.")
+tools = [generate_image]
+api_key = os.getenv("GROQ_API_KEY")
+if not api_key:
+    raise RuntimeError(
+        "GROQ_API_KEY is not set. Add it to your .env file or environment variables."
+    )
+llm = ChatGroq(
+    model="llama-3.1-8b-instant",
+    api_key=api_key
+).bind_tools(tools)
 
-        for msg in state.get("messages", []):
-            if isinstance(msg, ToolMessage) and msg.name == "generate_image_tool":
-                generation_output.append(msg.content)
-                print(f"Image generated and added to state.")
 
-        state["generation_output"] = generation_output
-        return state
+def model_call(state: AgentState) -> AgentState:
+    prompt = """You are a helpful assistant that can generate images using the provided tool.
+- When the user asks for an image, call the `generate_image` tool.
+- Respond clearly with the image URL returned by the tool.
+- If the user asks for something unrelated, explain that you can help with image generation.
+- if the user wants to stop , return a message saying "Goodbye!" and do not call any tools.
+"""
+    system_message = SystemMessage(content=prompt)
+    response = llm.invoke([system_message, *state["messages"]])
+    print(f"model response: {response.content}")
+    return {"messages": [response]}
 
-    # -------------------------
-    # Routing function
-    # -------------------------
-    def routing(state: ImageGenState) -> str:
-        ai_message = state["messages"][-1]
-        if hasattr(ai_message, "tool_calls") and len(ai_message.tool_calls) > 0:
-            return "tool"
-        return "done"
 
-    return assistant, extract_images, routing
+def should_continue(state: AgentState) -> Literal["continue", "end"]:
+    if state["messages"][-1].tool_calls:
+        return "continue"
+    return "end"
+
+tools_node = ToolNode(tools=tools)
+graph = StateGraph(AgentState)
+graph.add_node("model_call", model_call)
+graph.add_node("tools_node", tools_node)
+graph.add_edge(START, "model_call")
+graph.add_conditional_edges(
+    "model_call",
+    should_continue,
+    {
+        "continue": "tools_node",
+        "end": END,
+    },
+)
+graph.add_edge("tools_node", "model_call")
+
+app = graph.compile()
